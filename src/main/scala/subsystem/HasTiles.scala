@@ -6,7 +6,7 @@ import Chisel._
 import chisel3.experimental.dontTouch
 import freechips.rocketchip.config.Parameters
 import freechips.rocketchip.devices.debug.TLDebugModule
-import freechips.rocketchip.devices.tilelink.{BasicBusBlocker, BasicBusBlockerParams, CLINT, TLPLIC}
+import freechips.rocketchip.devices.tilelink.{BasicBusBlocker, BasicBusBlockerParams, CLINT, CLINTConsts, TLPLIC}
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.interrupts._
 import freechips.rocketchip.tile.{BaseTile, LookupByHartId, LookupByHartIdImpl, TileKey, TileParams, SharedMemoryTLEdge, HasExternallyDrivenTileConstants}
@@ -40,78 +40,69 @@ trait HasTiles { this: BaseSubsystem =>
   }
 
   protected def connectMasterPortsToSBus(tile: BaseTile, crossing: RocketCrossingParams) {
-    def tileMasterBuffering: TLOutwardNode = tile {
-      crossing.crossingType match {
-        case _: AsynchronousCrossing => tile.masterNode
-        case SynchronousCrossing(b) =>
-          tile.masterNode
-        case RationalCrossing(dir) =>
-          require (dir != SlowToFast, "Misconfiguration? Core slower than fabric")
-          tile.makeMasterBoundaryBuffers :=* tile.masterNode
-      }
-    }
-
     sbus.fromTile(tile.tileParams.name, crossing.master.buffers) {
         crossing.master.cork
           .map { u => TLCacheCork(unsafe = u) }
-          .map { _ :=* tile.crossTLOut }
-          .getOrElse { tile.crossTLOut }
-    } :=* tileMasterBuffering
+          .map { _ :=* tile.crossMasterPort() }
+          .getOrElse { tile.crossMasterPort() }
+    }
   }
 
   protected def connectSlavePortsToCBus(tile: BaseTile, crossing: RocketCrossingParams)(implicit valName: ValName) {
-    def tileSlaveBuffering: TLInwardNode = tile {
-      crossing.crossingType match {
-        case RationalCrossing(_) => tile.slaveNode :*= tile.makeSlaveBoundaryBuffers
-        case _ => tile.slaveNode
-      }
-    }
 
     DisableMonitors { implicit p =>
-      tileSlaveBuffering :*= sbus.control_bus.toTile(tile.tileParams.name) {
+      sbus.control_bus.toTile(tile.tileParams.name) {
         crossing.slave.blockerCtrlAddr
           .map { BasicBusBlockerParams(_, pbus.beatBytes, sbus.beatBytes) }
           .map { bbbp => LazyModule(new BasicBusBlocker(bbbp)) }
           .map { bbb =>
             sbus.control_bus.toVariableWidthSlave(Some("bus_blocker")) { bbb.controlNode }
-            tile.crossTLIn :*= bbb.node
-          } .getOrElse { tile.crossTLIn }
+            tile.crossSlavePort() :*= bbb.node
+          } .getOrElse { tile.crossSlavePort() }
       }
     }
   }
 
   protected def connectInterrupts(tile: BaseTile, debugOpt: Option[TLDebugModule], clintOpt: Option[CLINT], plicOpt: Option[TLPLIC]) {
     // Handle all the different types of interrupts crossing to or from the tile:
+    // NOTE: The order of calls to := matters! They must match how interrupts
+    //       are decoded from tile.intInwardNode inside the tile. For this reason,
+    //       we stub out missing interrupts with constant sources here.
+
     // 1. Debug interrupt is definitely asynchronous in all cases.
-    // 2. The CLINT and PLIC output interrupts are synchronous to the periphery clock,
+    tile.intInwardNode :=
+      debugOpt
+        .map { tile { IntSyncCrossingSink(3) } := _.intnode }
+        .getOrElse { NullIntSource() }
+
+    // 2. The CLINT and PLIC output interrupts are synchronous to the TileLink bus clock,
     //    so might need to be synchronized depending on the Tile's crossing type.
-    // 3. Local Interrupts are required to already be synchronous to the tile clock.
+
+    //    From CLINT: "msip" and "mtip"
+    tile.crossIntIn() :=
+      clintOpt.map { _.intnode }
+        .getOrElse { NullIntSource(sources = CLINTConsts.ints) }
+
+    //    From PLIC: "meip" (TODO: should come from external source if no PLIC)
+    tile.crossIntIn() :=
+      plicOpt .map { _.intnode }
+        .getOrElse { NullIntSource() }
+
+    //    From PLIC: "seip" (only if vm/supervisor mode is enabled)
+    if (tile.tileParams.core.useVM) {
+      tile.crossIntIn() :=
+        plicOpt .map { _.intnode }
+          .getOrElse { NullIntSource() }
+    }
+
+    // 3. Local Interrupts ("lip") are required to already be synchronous to the Tile's clock.
+    // (they are connected to tile.intInwardNode in a seperate trait)
+
     // 4. Interrupts coming out of the tile are sent to the PLIC,
     //    so might need to be synchronized depending on the Tile's crossing type.
-    // NOTE: The order of calls to := matters! They must match how interrupts
-    //       are decoded from tile.intNode inside the tile.
-
-    // 1. always async crossing for debug
-    debugOpt.foreach { debug =>
-      tile.intInwardNode := tile { IntSyncCrossingSink(3) } := debug.intnode
-    }
-
-    // 2. clint+plic conditionally crossing
-    val periphIntNode = tile.intInwardNode :=* tile.crossIntIn
-    clintOpt.foreach { periphIntNode := _.intnode }    // msip+mtip
-    plicOpt.foreach { plic =>
-      periphIntNode := plic.intnode                    // meip
-      if (tile.tileParams.core.useVM)
-        periphIntNode := plic.intnode                  // seip
-    }
-
-    // 3. local interrupts  never cross
-    // tile.intInwardNode is wired up externally       // lip
-
-    // 4. conditional crossing from core to PLIC
     plicOpt.foreach { plic =>
       FlipRendering { implicit p =>
-        plic.intnode :=* tile.crossIntOut :=* tile.intOutwardNode
+        plic.intnode :=* tile.crossIntOut()
       }
     }
   }

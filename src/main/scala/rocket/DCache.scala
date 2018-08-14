@@ -42,7 +42,16 @@ class DCacheDataArray(implicit p: Parameters) extends L1HellaCacheModule()(p) {
   val wMask = if (nWays == 1) eccMask else (0 until nWays).flatMap(i => eccMask.map(_ && io.req.bits.way_en(i)))
   val wWords = io.req.bits.wdata.grouped(encBits * (wordBits / eccBits))
   val addr = io.req.bits.addr >> rowOffBits
-  val data_arrays = Seq.fill(rowBytes / wordBytes) { SeqMem(nSets * refillCycles, Vec(nWays * (wordBits / eccBits), UInt(width = encBits))) }
+  val data_arrays = Seq.tabulate(rowBytes / wordBytes) {
+    i =>
+      DescribedSRAM(
+        name = s"data_arrays_${i}",
+        desc = "DCache Data Array",
+        size = nSets * refillCycles,
+        data = Vec(nWays * (wordBits / eccBits), UInt(width = encBits))
+      )
+  }
+
   val rdata = for ((array, i) <- data_arrays zipWithIndex) yield {
     val valid = io.req.valid && (Bool(data_arrays.size == 1) || io.req.bits.wordMask(i))
     when (valid && io.req.bits.write) {
@@ -76,7 +85,13 @@ class DCacheModule(outer: DCache) extends HellaCacheModule(outer) {
   // tags
   val replacer = cacheParams.replacement
   val metaArb = Module(new Arbiter(new DCacheMetadataReq, 8))
-  val tag_array = SeqMem(nSets, Vec(nWays, UInt(width = tECC.width(metaArb.io.out.bits.data.getWidth))))
+
+  val tag_array = DescribedSRAM(
+    name = "tag_array",
+    desc = "DCache Tag Array",
+    size = nSets,
+    data = Vec(nWays, UInt(width = tECC.width(metaArb.io.out.bits.data.getWidth)))
+  )
 
   // data
   val data = Module(new DCacheDataArray)
@@ -636,13 +651,17 @@ class DCacheModule(outer: DCache) extends HellaCacheModule(outer) {
   io.cpu.resp.bits <> s2_req
   io.cpu.resp.bits.has_data := s2_read
   io.cpu.resp.bits.replay := false
-  io.cpu.ordered := !(s1_valid || s2_valid || cached_grant_wait || uncachedInFlight.asUInt.orR)
+
+  // report whether there are any outstanding accesses.  disregard any
+  // slave-port accesses, since they don't affect local memory ordering.
+  val s1_isSlavePortAccess = usingDataScratchpad && s1_req.phys
+  val s2_isSlavePortAccess = usingDataScratchpad && s2_req.phys
+  io.cpu.ordered := !(s1_valid && !s1_isSlavePortAccess || s2_valid && !s2_isSlavePortAccess || cached_grant_wait || uncachedInFlight.asUInt.orR)
 
   val s1_xcpt_valid = tlb.io.req.valid && !s1_nack
   val s1_xcpt = tlb.io.resp
   io.cpu.s2_xcpt := Mux(RegNext(s1_xcpt_valid), RegEnable(s1_xcpt, s1_valid_not_nacked), 0.U.asTypeOf(s1_xcpt))
 
-  val s2_isSlavePortAccess = s2_req.phys
   if (usingDataScratchpad) {
     require(!usingVM) // therefore, req.phys means this is a slave-port access
     when (s2_isSlavePortAccess) {

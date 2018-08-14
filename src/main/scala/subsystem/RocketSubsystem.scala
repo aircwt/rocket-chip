@@ -18,7 +18,7 @@ case class TileMasterPortParams(buffers: Int = 0, cork: Option[Boolean] = None)
 case class TileSlavePortParams(buffers: Int = 0, blockerCtrlAddr: Option[BigInt] = None)
 
 case class RocketCrossingParams(
-    crossingType: SubsystemClockCrossing = SynchronousCrossing(),
+    crossingType: ClockCrossingType = SynchronousCrossing(),
     master: TileMasterPortParams = TileMasterPortParams(),
     slave: TileSlavePortParams = TileSlavePortParams()) {
   def knownRatio: Option[Int] = crossingType match {
@@ -31,7 +31,7 @@ case object RocketTilesKey extends Field[Seq[RocketTileParams]](Nil)
 case object RocketCrossingKey extends Field[Seq[RocketCrossingParams]](List(RocketCrossingParams()))
 
 trait HasRocketTiles extends HasTiles
-    with HasPeripheryPLIC
+    with CanHavePeripheryPLIC
     with CanHavePeripheryCLINT
     with HasPeripheryDebug { this: BaseSubsystem =>
   val module: HasRocketTilesModuleImp
@@ -49,7 +49,7 @@ trait HasRocketTiles extends HasTiles
 
     connectMasterPortsToSBus(rocket, crossing)
     connectSlavePortsToCBus(rocket, crossing)
-    connectInterrupts(rocket, Some(debug), clintOpt, Some(plic))
+    connectInterrupts(rocket, Some(debug), clintOpt, plicOpt)
 
     rocket
   }
